@@ -99,75 +99,89 @@ void merge_state(const AggLayout& layout, std::uint8_t* dst, const std::uint8_t*
   }
 }
 
-// Open addressing with linear probing over group indices. Keys and hashes
-// live in arrays next to the state rows, so growing rehashes only the small
-// slot array. Group-by keys of at most two dictionary columns (16 bits)
-// index a direct table instead and never hash on the hot path.
+// Open addressing with linear probing. A slot holds the group index in its
+// low 32 bits and the top 32 bits of the key's hash as a tag, so a probe
+// that lands on another group is rejected without touching that group's
+// row. Each group's key and aggregate states share one row, so a hit costs
+// one cache miss for the slot and one for the row. Group-by keys of at most
+// two dictionary columns (16 bits) index a direct table instead and never
+// hash on the hot path.
 template <class K>
 class AggTable {
  public:
+  static constexpr std::size_t kKeyBytes = (sizeof(K) + 15) / 16 * 16;
+
   AggTable(const AggLayout* layout, bool direct, std::size_t direct_bits)
-      : layout_(layout), direct_(direct) {
+      : layout_(layout), direct_(direct), stride_(kKeyBytes + layout->stride) {
     slots_.assign(direct ? (std::size_t{1} << direct_bits) : 1024, 0);
     mask_ = slots_.size() - 1;
   }
 
+  void prefetch(std::uint64_t hash) const { __builtin_prefetch(&slots_[hash & mask_]); }
+
   std::uint32_t find_or_insert(const K& key) {
     if (direct_) {
-      std::uint32_t& s = slots_[static_cast<std::size_t>(key_word(key, 0))];
-      if (s == 0) s = add_group(key, hash_key(key)) + 1;
-      return s - 1;
+      std::uint64_t& s = slots_[static_cast<std::size_t>(key_word(key, 0))];
+      if (s == 0) s = add_group(key) + 1;
+      return static_cast<std::uint32_t>(s - 1);
     }
     return find_or_insert(key, hash_key(key));
   }
 
   std::uint32_t find_or_insert(const K& key, std::uint64_t hash) {
     if (direct_) return find_or_insert(key);
+    const std::uint64_t tag = hash & 0xFFFFFFFF00000000ULL;
     for (std::size_t i = hash & mask_;; i = (i + 1) & mask_) {
-      const std::uint32_t s = slots_[i];
+      const std::uint64_t s = slots_[i];
       if (s == 0) {
-        const std::uint32_t g = add_group(key, hash);
-        slots_[i] = g + 1;
-        if (2 * groups() > slots_.size()) grow();
+        const std::uint32_t g = add_group(key);
+        slots_[i] = tag | (g + 1);
+        if (2 * groups_ > slots_.size()) grow();
         return g;
       }
-      if (hashes_[s - 1] == hash && keys_[s - 1] == key) return s - 1;
+      if ((s & 0xFFFFFFFF00000000ULL) == tag) {
+        const auto g = static_cast<std::uint32_t>((s & 0xFFFFFFFFu) - 1);
+        if (this->key(g) == key) return g;
+      }
     }
   }
 
-  std::size_t groups() const { return keys_.size(); }
-  const K& key(std::uint32_t g) const { return keys_[g]; }
-  std::uint64_t hash(std::uint32_t g) const { return hashes_[g]; }
-  std::uint8_t* state(std::uint32_t g) { return states_.data() + g * layout_->stride; }
-  const std::uint8_t* state(std::uint32_t g) const { return states_.data() + g * layout_->stride; }
+  std::size_t groups() const { return groups_; }
+  std::size_t row_stride() const { return stride_; }
+  const K& key(std::uint32_t g) const { return *reinterpret_cast<const K*>(rows_.data() + g * stride_); }
+  std::uint64_t hash(std::uint32_t g) const { return hash_key(key(g)); }
+  std::uint8_t* state(std::uint32_t g) { return rows_.data() + g * stride_ + kKeyBytes; }
+  const std::uint8_t* state(std::uint32_t g) const { return rows_.data() + g * stride_ + kKeyBytes; }
 
  private:
-  std::uint32_t add_group(const K& key, std::uint64_t hash) {
-    const auto g = static_cast<std::uint32_t>(keys_.size());
-    keys_.push_back(key);
-    hashes_.push_back(hash);
-    states_.resize((g + 1) * layout_->stride);
+  std::uint32_t add_group(const K& key) {
+    const auto g = static_cast<std::uint32_t>(groups_++);
+    rows_.resize(groups_ * stride_);
+    *reinterpret_cast<K*>(rows_.data() + g * stride_) = key;
     init_state(*layout_, state(g));
     return g;
   }
 
+  // Rehashes by walking the rows in order (sequential reads) rather than the
+  // old slots (a random row access per entry).
   void grow() {
     slots_.assign(slots_.size() * 2, 0);
     mask_ = slots_.size() - 1;
-    for (std::uint32_t g = 0; g < keys_.size(); ++g) {
-      std::size_t i = hashes_[g] & mask_;
+    for (std::uint32_t g = 0; g < groups_; ++g) {
+      const std::uint64_t h = hash(g);
+      std::size_t i = h & mask_;
       while (slots_[i] != 0) i = (i + 1) & mask_;
-      slots_[i] = g + 1;
+      slots_[i] = (h & 0xFFFFFFFF00000000ULL) | (g + 1);
     }
   }
 
   const AggLayout* layout_;
   bool direct_;
-  std::vector<std::uint32_t> slots_;
+  std::size_t stride_;
+  std::vector<std::uint64_t> slots_;
   std::size_t mask_ = 0;
-  std::vector<K> keys_;
-  std::vector<std::uint64_t> hashes_;
-  Buffer states_;
+  std::size_t groups_ = 0;
+  Buffer rows_;
 };
 
 template <class K>
@@ -175,6 +189,7 @@ struct AggLocal final : SinkState {
   AggLocal(const AggLayout* layout, bool direct, std::size_t bits) : table(layout, direct, bits) {}
   AggTable<K> table;
   std::vector<K> keys = std::vector<K>(kVectorSize);
+  std::vector<std::uint64_t> hashes = std::vector<std::uint64_t>(kVectorSize);
   std::vector<std::uint32_t> gids = std::vector<std::uint32_t>(kVectorSize);
   std::vector<std::vector<std::uint32_t>> partitions;
 };
@@ -230,12 +245,23 @@ class AggregateSink final : public Sink {
       std::fill(gids, gids + sel.count, g);
     } else {
       pack_keys(keys_, chunk, sel, local.keys.data());
-      std::uint32_t j = 0;
-      for_each_selected(sel, [&](std::uint32_t i) { gids[j++] = table.find_or_insert(local.keys[i]); });
+      if (direct_) {
+        std::uint32_t j = 0;
+        for_each_selected(sel, [&](std::uint32_t i) { gids[j++] = table.find_or_insert(local.keys[i]); });
+      } else {
+        // Hash the whole vector and prefetch the slots first, so the cache
+        // misses of a large table overlap.
+        for_each_selected(sel, [&](std::uint32_t i) {
+          local.hashes[i] = hash_key(local.keys[i]);
+          table.prefetch(local.hashes[i]);
+        });
+        std::uint32_t j = 0;
+        for_each_selected(sel, [&](std::uint32_t i) { gids[j++] = table.find_or_insert(local.keys[i], local.hashes[i]); });
+      }
     }
     if (table.groups() == 0) return;
     std::uint8_t* states = table.state(0);
-    const std::size_t stride = layout_.stride;
+    const std::size_t stride = table.row_stride();
 
     for (std::size_t a = 0; a < layout_.aggs.size(); ++a) {
       const BoundAgg& agg = layout_.aggs[a];
