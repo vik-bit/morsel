@@ -11,6 +11,7 @@ endif()
 
 option(MORSEL_BUILD_TESTS "Build the C++ tests" ON)
 option(MORSEL_SANITIZE "Build with AddressSanitizer and UBSan" OFF)
+option(MORSEL_TSAN "Build with ThreadSanitizer" OFF)
 
 find_package(Threads REQUIRED)
 
@@ -35,6 +36,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   if(MORSEL_SANITIZE)
     target_compile_options(morsel PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_link_options(morsel PUBLIC -fsanitize=address,undefined)
+  endif()
+  if(MORSEL_TSAN)
+    target_compile_options(morsel PUBLIC -fsanitize=thread)
+    target_link_options(morsel PUBLIC -fsanitize=thread)
   endif()
 endif()
 
