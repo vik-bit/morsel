@@ -9,6 +9,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+option(MORSEL_BUILD_TESTS "Build the C++ tests" ON)
 option(MORSEL_SANITIZE "Build with AddressSanitizer and UBSan" OFF)
 
 find_package(Threads REQUIRED)
@@ -41,3 +42,13 @@ add_executable(morsel_cli tools/morsel_cli.cpp)
 set_target_properties(morsel_cli PROPERTIES OUTPUT_NAME morsel)
 target_link_libraries(morsel_cli PRIVATE morsel)
 
+if(MORSEL_BUILD_TESTS)
+  enable_testing()
+  add_executable(morsel_tests
+    tests/test_main.cpp
+    tests/test_kernels.cpp
+    tests/test_expr.cpp
+    tests/test_operators.cpp)
+  target_link_libraries(morsel_tests PRIVATE morsel)
+  add_test(NAME morsel_tests COMMAND morsel_tests)
+endif()
