@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  cpp:
+    name: C++ tests (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: release, os: ubuntu-latest, config: Release, flags: "" }
+          - { name: asan+ubsan, os: ubuntu-latest, config: Debug, flags: "-DMORSEL_SANITIZE=ON" }
+          - { name: tsan, os: ubuntu-latest, config: RelWithDebInfo, flags: "-DMORSEL_TSAN=ON" }
+          # Apple silicon: no AVX2, so this runs the scalar kernels end to end.
+          - { name: macos-arm64, os: macos-14, config: Release, flags: "" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Allow ThreadSanitizer's memory layout
+        if: matrix.name == 'tsan'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.config }} ${{ matrix.flags }}
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  tpch:
+    name: TPC-H answers match DuckDB (SF 0.01)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install DuckDB
+        run: pip install -r requirements.txt
+      - name: Build
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMORSEL_BUILD_TESTS=OFF && cmake --build build --parallel
+      - name: Generate TPC-H data
+        run: python scripts/gen_tpch.py --sf 0.01 --out data/sf0.01
+      - name: Compare every query with DuckDB
+        run: python tests/check_tpch.py --morsel build/morsel --data data/sf0.01 --threads 1 4 --scalar
